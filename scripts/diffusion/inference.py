@@ -3,6 +3,10 @@ import time
 import warnings
 from pprint import pformat
 
+import sys
+
+sys.path.append(".")
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
