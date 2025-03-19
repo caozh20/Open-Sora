@@ -11,6 +11,11 @@ import torch.distributed as dist
 from colossalai.utils import set_seed
 from tqdm import tqdm
 
+# 导入补丁并确保它被应用
+from opensora.patches.hybrid_plugin_patch import apply_hybrid_plugin_patches
+# 确保补丁被应用
+_ = apply_hybrid_plugin_patches()
+
 from opensora.acceleration.parallel_states import get_data_parallel_group, get_tensor_parallel_group, set_tensor_parallel_group
 from opensora.datasets.dataloader import prepare_dataloader
 from opensora.registry import DATASETS, build_module
@@ -64,6 +69,12 @@ def main():
     # 设置张量并行度，默认为可用GPU数量
     tp_size = cfg.plugin_config.get("tp_size", torch.cuda.device_count())
     cfg.plugin_config["tp_size"] = tp_size
+    # 删除skip_pg_mesh参数，采用另一种方法解决
+    if "skip_pg_mesh" in cfg.plugin_config:
+        del cfg.plugin_config["skip_pg_mesh"]
+    # 添加初始化相关参数，确保pg_mesh正确创建
+    cfg.plugin_config["enable_all_optimization"] = False
+    cfg.plugin_config["use_cpuoffload"] = False
     # 将插件类型设置为hybrid以启用模型并行
     cfg.plugin = "hybrid"
     
@@ -327,6 +338,32 @@ def main():
 
     logger.info("Inference finished.")
     log_cuda_max_memory("inference")
+    
+    # 确保清理所有资源
+    if tp_size > 1:
+        logger.info("Cleaning up tensor parallel resources...")
+        # 清理模型
+        del model
+        del model_ae
+        if 'model_t5' in locals():
+            del model_t5
+        if 'model_clip' in locals():
+            del model_clip
+        if 'optional_models' in locals():
+            del optional_models
+        # 清理booster
+        if booster:
+            del booster
+        if booster_ae:
+            del booster_ae
+        # 强制GC回收内存
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        # 等待所有进程完成清理
+        dist.barrier()
+        
+    logger.info("All resources cleaned up successfully.")
 
 
 if __name__ == "__main__":
