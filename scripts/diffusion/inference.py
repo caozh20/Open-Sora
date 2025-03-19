@@ -11,13 +11,14 @@ import torch.distributed as dist
 from colossalai.utils import set_seed
 from tqdm import tqdm
 
-from opensora.acceleration.parallel_states import get_data_parallel_group
+from opensora.acceleration.parallel_states import get_data_parallel_group, get_tensor_parallel_group, set_tensor_parallel_group
 from opensora.datasets.dataloader import prepare_dataloader
 from opensora.registry import DATASETS, build_module
 from opensora.utils.cai import (
     get_booster,
     get_is_saving_process,
     init_inference_environment,
+    set_group_size,
 )
 from opensora.utils.config import parse_alias, parse_configs
 from opensora.utils.inference import (
@@ -57,12 +58,35 @@ def main():
         set_seed(seed)
 
     # == init distributed env ==
+    # 设置默认的模型并行配置
+    if "plugin_config" not in cfg:
+        cfg.plugin_config = {}
+    # 设置张量并行度，默认为可用GPU数量
+    tp_size = cfg.plugin_config.get("tp_size", torch.cuda.device_count())
+    cfg.plugin_config["tp_size"] = tp_size
+    # 将插件类型设置为hybrid以启用模型并行
+    cfg.plugin = "hybrid"
+    
+    # 初始化分布式环境
     init_inference_environment()
+    # 设置张量并行组
+    if tp_size > 1:
+        # 创建并设置tensor parallel组
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        tp_group_ranks = list(range(0, world_size, world_size // tp_size))
+        tp_group = dist.new_group(tp_group_ranks)
+        set_tensor_parallel_group(tp_group)
+        
     logger = create_logger()
     logger.info("Inference configuration:\n %s", pformat(cfg.to_dict()))
     is_saving_process = get_is_saving_process(cfg)
     booster = get_booster(cfg)
     booster_ae = get_booster(cfg, ae=True)
+    
+    # 输出模型并行信息
+    if tp_size > 1:
+        logger.info(f"Using Tensor Parallelism with {tp_size} GPUs")
 
     # ======================================================
     # 2. build dataset and dataloader
@@ -124,17 +148,52 @@ def main():
     logger.info("Building models...")
 
     # == build flux model ==
+    if tp_size > 1:
+        logger.info(f"Model will be split across {tp_size} GPUs using Tensor Parallelism")
+        
+    # 确保模型配置考虑到张量并行
+    if tp_size > 1 and "model" in cfg:
+        # 为模型添加并行配置
+        if "parallel_config" not in cfg.model:
+            cfg.model.parallel_config = {}
+        cfg.model.parallel_config["tensor_parallel_size"] = tp_size
+        
+        # 如果存在自动编码器，也为其添加并行配置
+        if "ae" in cfg:
+            if "parallel_config" not in cfg.ae:
+                cfg.ae.parallel_config = {}
+            cfg.ae.parallel_config["tensor_parallel_size"] = tp_size
+            
+            # 如果存在图像flux模型，也为其添加并行配置
+            if "img_flux" in cfg:
+                if "parallel_config" not in cfg.img_flux:
+                    cfg.img_flux.parallel_config = {}
+                cfg.img_flux.parallel_config["tensor_parallel_size"] = tp_size
+                
+                if "img_flux_ae" in cfg:
+                    if "parallel_config" not in cfg.img_flux_ae:
+                        cfg.img_flux_ae.parallel_config = {}
+                    cfg.img_flux_ae.parallel_config["tensor_parallel_size"] = tp_size
+
     model, model_ae, model_t5, model_clip, optional_models = prepare_models(
         cfg, device, dtype, offload_model=cfg.get("offload_model", False)
     )
     log_cuda_max_memory("build model")
 
     if booster:
+        logger.info("Applying booster to model...")
         model, _, _, _, _ = booster.boost(model=model)
         model = model.unwrap()
     if booster_ae:
+        logger.info("Applying booster to autoencoder model...")
         model_ae, _, _, _, _ = booster_ae.boost(model=model_ae)
         model_ae = model_ae.unwrap()
+
+    # 如果使用张量并行，记录内存使用情况
+    if tp_size > 1:
+        log_cuda_max_memory("after model parallel boost")
+        if is_main_process():
+            logger.info("Model has been split across multiple GPUs using Tensor Parallelism")
 
     api_fn = prepare_api(model, model_ae, model_t5, model_clip, optional_models)
 
@@ -167,12 +226,41 @@ def main():
                     )
                     if cfg.get("offload_model", False):
                         model_move_start = time.time()
-                        model = model.to("cpu", dtype)
-                        model_ae = model_ae.to("cpu", dtype)
-                        optional_models["img_flux"].to(device, dtype)
-                        optional_models["img_flux_ae"].to(device, dtype)
+                        
+                        # 处理张量并行情况下的模型加载与卸载
+                        if tp_size > 1:
+                            logger.info("Loading video diffusion model back to GPU in tensor parallel mode")
+                            # 加载视频模型到GPU
+                            if hasattr(model, "to_tensor_parallel"):
+                                model.to_tensor_parallel(device, dtype)
+                            else:
+                                model = model.to(device, dtype)
+                                
+                            if hasattr(model_ae, "to_tensor_parallel"):
+                                model_ae.to_tensor_parallel(device, dtype)
+                            else:
+                                model_ae = model_ae.to(device, dtype)
+                                
+                            # 卸载图像flux模型到CPU
+                            logger.info("Offloading image flux models to CPU in tensor parallel mode")
+                            if hasattr(optional_models["img_flux"], "to_tensor_parallel"):
+                                optional_models["img_flux"].to_tensor_parallel("cpu", dtype)
+                            else:
+                                optional_models["img_flux"].to("cpu", dtype)
+                                
+                            if hasattr(optional_models["img_flux_ae"], "to_tensor_parallel"):
+                                optional_models["img_flux_ae"].to_tensor_parallel("cpu", dtype)
+                            else:
+                                optional_models["img_flux_ae"].to("cpu", dtype)
+                        else:
+                            # 非并行模式下的处理
+                            model = model.to(device, dtype)
+                            model_ae = model_ae.to(device, dtype)
+                            optional_models["img_flux"].to("cpu", dtype)
+                            optional_models["img_flux_ae"].to("cpu", dtype)
+                        
                         logger.info(
-                            "offload video diffusion model to cpu, load image flux model to gpu: %s s",
+                            "load video diffusion model to gpu, offload image flux model to cpu: %s s",
                             time.time() - model_move_start,
                         )
 
