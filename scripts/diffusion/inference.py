@@ -78,7 +78,6 @@ def main():
         del cfg.plugin_config["skip_pg_mesh"]
     # 添加初始化相关参数，确保pg_mesh正确创建
     cfg.plugin_config["enable_all_optimization"] = False
-    cfg.plugin_config["use_cpuoffload"] = False
     # 将插件类型设置为hybrid以启用模型并行
     cfg.plugin = "hybrid"
     
