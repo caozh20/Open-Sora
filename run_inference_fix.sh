@@ -5,11 +5,14 @@
 gpu_count=$(nvidia-smi --list-gpus | wc -l)
 # 获取提示词，默认为"raining, sea"
 prompt="${1:-raining, sea}"
+# 获取配置文件，默认为t2i2v_768px.py
+config="${2:-configs/diffusion/inference/t2i2v_768px.py}"
 
 echo "====================================================="
 echo "  Open-Sora 模型并行推理"
 echo "====================================================="
 echo "使用 $gpu_count 个GPU进行模型并行推理"
+echo "配置文件: $config"
 echo "提示词: $prompt"
 echo "====================================================="
 
@@ -29,8 +32,8 @@ cleanup() {
 # 注册信号处理
 trap cleanup SIGINT SIGTERM
 
-# 运行推理
-torchrun --nproc_per_node=$gpu_count --standalone scripts/diffusion/inference.py configs/diffusion/inference/t2i2v_768px.py --save-dir samples --prompt "$prompt"
+# 运行推理 - 注意脚本现在已经有了防止tp_size>world_size的保护措施
+torchrun --nproc_per_node=$gpu_count --standalone scripts/diffusion/inference.py $config --save-dir samples --prompt "$prompt"
 
 # 检查运行结果
 result=$?

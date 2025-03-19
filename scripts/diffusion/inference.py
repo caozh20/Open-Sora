@@ -85,7 +85,22 @@ def main():
         # 创建并设置tensor parallel组
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        tp_group_ranks = list(range(0, world_size, world_size // tp_size))
+        
+        # 确保tp_size不超过world_size，避免除零错误
+        if tp_size > world_size:
+            logger.warning(f"指定的tp_size ({tp_size}) 大于world_size ({world_size})，将自动调整为world_size")
+            tp_size = world_size
+            cfg.plugin_config["tp_size"] = tp_size
+        
+        # 计算步长，避免除零
+        stride = max(1, world_size // tp_size)
+        tp_group_ranks = list(range(0, world_size, stride))
+        
+        # 如果组大小不符合预期，进行调整
+        if len(tp_group_ranks) != tp_size:
+            logger.warning(f"由于world_size ({world_size}) 不能被tp_size ({tp_size}) 整除，实际的张量并行组大小为 {len(tp_group_ranks)}")
+            
+        # 创建新的处理器组    
         tp_group = dist.new_group(tp_group_ranks)
         set_tensor_parallel_group(tp_group)
         
@@ -164,27 +179,33 @@ def main():
         
     # 确保模型配置考虑到张量并行
     if tp_size > 1 and "model" in cfg:
+        # 获取实际的张量并行组大小
+        if hasattr(dist, "get_world_size") and get_tensor_parallel_group() is not None:
+            actual_tp_size = len(tp_group_ranks)
+        else:
+            actual_tp_size = tp_size
+        
         # 为模型添加并行配置
         if "parallel_config" not in cfg.model:
             cfg.model.parallel_config = {}
-        cfg.model.parallel_config["tensor_parallel_size"] = tp_size
+        cfg.model.parallel_config["tensor_parallel_size"] = actual_tp_size
         
         # 如果存在自动编码器，也为其添加并行配置
         if "ae" in cfg:
             if "parallel_config" not in cfg.ae:
                 cfg.ae.parallel_config = {}
-            cfg.ae.parallel_config["tensor_parallel_size"] = tp_size
+            cfg.ae.parallel_config["tensor_parallel_size"] = actual_tp_size
             
             # 如果存在图像flux模型，也为其添加并行配置
             if "img_flux" in cfg:
                 if "parallel_config" not in cfg.img_flux:
                     cfg.img_flux.parallel_config = {}
-                cfg.img_flux.parallel_config["tensor_parallel_size"] = tp_size
+                cfg.img_flux.parallel_config["tensor_parallel_size"] = actual_tp_size
                 
                 if "img_flux_ae" in cfg:
                     if "parallel_config" not in cfg.img_flux_ae:
                         cfg.img_flux_ae.parallel_config = {}
-                    cfg.img_flux_ae.parallel_config["tensor_parallel_size"] = tp_size
+                    cfg.img_flux_ae.parallel_config["tensor_parallel_size"] = actual_tp_size
 
     model, model_ae, model_t5, model_clip, optional_models = prepare_models(
         cfg, device, dtype, offload_model=cfg.get("offload_model", False)
